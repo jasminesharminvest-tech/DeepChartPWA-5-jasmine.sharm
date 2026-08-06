@@ -31,6 +31,8 @@ export class ConnectionManager {
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private staleTimer: ReturnType<typeof setInterval> | null = null;
   private lastTickAt = 0;
+  private lastCandleAt = 0;
+  private resyncing = false;
   private statusListeners = new Set<StatusListener>();
   private tickListeners = new Set<TickListener>();
   private candleListeners = new Set<CandleListener>();
@@ -120,6 +122,7 @@ export class ConnectionManager {
   private attachSource(source: DataSource): void {
     this.sourceUnsubs.push(
       source.onCandle((candle, isClosed) => {
+        this.lastCandleAt = Date.now();
         this.checkStreamIntegrity(candle);
         this.emit(this.candleListeners, candle, isClosed);
       }),
@@ -140,8 +143,11 @@ export class ConnectionManager {
 
   private checkStreamIntegrity(candle: Candle): void {
     if (this.prevCandleTime !== null && this.activeTimeframe !== null) {
-      const expectedOpen = this.prevCandleTime + TIMEFRAME_SECONDS[this.activeTimeframe];
-      if (candle.time !== expectedOpen && candle.time !== this.prevCandleTime) {
+      const tfSec = TIMEFRAME_SECONDS[this.activeTimeframe];
+      const expectedOpen = this.prevCandleTime + tfSec;
+      // Only resync on large gaps (> 2x timeframe) to avoid cascading resyncs
+      // on normal session-boundary gaps in forex.
+      if (candle.time !== expectedOpen && candle.time !== this.prevCandleTime && Math.abs(candle.time - expectedOpen) > tfSec * 2) {
         captureError(new Error(`Stream gap: expected open ${expectedOpen}, got ${candle.time} (prev ${this.prevCandleTime})`), { level: 'warning' });
         void this.resync();
       }
@@ -150,7 +156,8 @@ export class ConnectionManager {
   }
 
   private async resync(): Promise<void> {
-    if (!this.activeSymbol || !this.activeTimeframe || !this.source) return;
+    if (this.resyncing || !this.activeSymbol || !this.activeTimeframe || !this.source) return;
+    this.resyncing = true;
     try {
       const fresh = await this.source.fetchHistory(this.activeSymbol.id, this.activeTimeframe, 50);
       const seen = new Set<number>();
@@ -159,12 +166,16 @@ export class ConnectionManager {
       for (const c of fresh) {
         if (seen.has(c.time)) continue;
         seen.add(c.time);
-        this.checkStreamIntegrity(c);
         const isClosed = serverNowSec >= c.time + tfSec;
         this.emit(this.candleListeners, c, isClosed);
       }
+      if (fresh.length > 0) {
+        this.prevCandleTime = fresh[fresh.length - 1].time;
+      }
     } catch {
       this.setStatus('degraded');
+    } finally {
+      this.resyncing = false;
     }
   }
 
@@ -187,11 +198,13 @@ export class ConnectionManager {
   private startStaleWatchdog(): void {
     if (this.staleTimer) clearInterval(this.staleTimer);
     this.lastTickAt = Date.now();
+    this.lastCandleAt = Date.now();
     this.staleTimer = setInterval(() => {
       if (this.status !== 'live') return;
       if (this.activeSymbol && !isMarketOpen(this.activeSymbol)) return;
-      if (Date.now() - this.lastTickAt > STALE_TICK_MS) {
-        captureError(new Error('Stale tick watchdog: no tick in 45s, forcing reconnect'), { level: 'warning' });
+      const now = Date.now();
+      if (now - this.lastTickAt > STALE_TICK_MS || now - this.lastCandleAt > STALE_TICK_MS) {
+        captureError(new Error('Stale watchdog: no data in 45s, forcing reconnect'), { level: 'warning' });
         void this.forceReconnect();
       }
     }, 15_000);
@@ -207,6 +220,7 @@ export class ConnectionManager {
     this.sourceUnsubs = [];
     if (this.source) { this.source.disconnect(); this.source = null; }
     this.lastTickAt = Date.now();
+    this.lastCandleAt = Date.now();
     const chain = ROUTING_CHAIN[this.activeSymbol.assetClass] ?? [];
     for (const sourceId of chain) {
       if (seq !== this.connectSeq) return;
@@ -230,6 +244,8 @@ export class ConnectionManager {
     if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
     if (this.staleTimer) { clearInterval(this.staleTimer); this.staleTimer = null; }
     this.lastTickAt = 0;
+    this.lastCandleAt = 0;
+    this.resyncing = false;
     this.sourceUnsubs.forEach((unsub) => { try { unsub(); } catch { /* isolate */ } });
     this.sourceUnsubs = [];
     if (this.source) {

@@ -1,7 +1,6 @@
 import type { Candle, Tick, Timeframe, ConnectionStatus, SourceId } from '@/types/domain';
 import type { DataSource, ConnectResult } from '../source';
 import { normalizeServerTime } from '../source';
-import { serverClock } from '../server-clock';
 import { mapSymbolForDeriv } from '../symbols';
 import { PROVIDERS_CONFIG, buildDerivWsUrl } from '../providers.config';
 import { captureError } from '@/lib/sentry';
@@ -37,6 +36,8 @@ export class DerivSource implements DataSource {
   private reconnectCount = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private lastEmittedCandleTime: number | null = null;
+  private lastEmittedCandle: Candle | null = null;
 
   async connect(symbolId: string, timeframe: Timeframe): Promise<ConnectResult> {
     const cfg = PROVIDERS_CONFIG.deriv;
@@ -47,11 +48,17 @@ export class DerivSource implements DataSource {
     this.activeSymbol = symbolId;
     this.activeTimeframe = timeframe;
     this.reconnectCount = 0;
+    this.lastEmittedCandleTime = null;
+    this.lastEmittedCandle = null;
     this.setStatus('connecting');
     await this.ensureSocket();
     const derivSymbol = mapSymbolForDeriv(symbolId);
     const candles = await this.fetchHistory(symbolId, timeframe, cfg.defaultHistory);
-    this.subscribeStreams(derivSymbol);
+    if (candles.length > 0) {
+      this.lastEmittedCandleTime = candles[candles.length - 1].time;
+      this.lastEmittedCandle = candles[candles.length - 1];
+    }
+    await this.subscribeStreams(derivSymbol);
     this.startPing();
     this.setStatus('live');
     return { candles, source: this.id };
@@ -61,6 +68,8 @@ export class DerivSource implements DataSource {
     this.activeSymbol = null;
     this.activeTimeframe = null;
     this.reconnectCount = 0;
+    this.lastEmittedCandleTime = null;
+    this.lastEmittedCandle = null;
     if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.ws) {
@@ -171,12 +180,20 @@ export class DerivSource implements DataSource {
     });
   }
 
-  private subscribeStreams(derivSymbol: string): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ ticks: derivSymbol, subscribe: 1 }));
+  private async subscribeStreams(derivSymbol: string): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('Deriv: socket not open for subscription');
+    }
     const granularity = PROVIDERS_CONFIG.deriv.granularityMap[this.activeTimeframe ?? '1m'];
+    await this.send({ ticks: derivSymbol, subscribe: 1 }).catch((err) => {
+      captureError(new Error(`Deriv ticks subscribe failed: ${err instanceof Error ? err.message : 'unknown'}`), { level: 'warning' });
+      throw err;
+    });
     if (granularity) {
-      this.ws.send(JSON.stringify({ ohlc: derivSymbol, subscribe: 1, granularity }));
+      await this.send({ ohlc: derivSymbol, subscribe: 1, granularity }).catch((err) => {
+        captureError(new Error(`Deriv ohlc subscribe failed: ${err instanceof Error ? err.message : 'unknown'}`), { level: 'warning' });
+        throw err;
+      });
     }
   }
 
@@ -207,7 +224,8 @@ export class DerivSource implements DataSource {
       if (!this.activeSymbol || !this.activeTimeframe) return;
       void this.ensureSocket().then(() => {
         const derivSymbol = mapSymbolForDeriv(this.activeSymbol!);
-        this.subscribeStreams(derivSymbol);
+        return this.subscribeStreams(derivSymbol);
+      }).then(() => {
         this.startPing();
         this.reconnectCount = 0;
         this.setStatus('live');
@@ -254,7 +272,6 @@ export class DerivSource implements DataSource {
 
     if (msg.ohlc) {
       const ohlc = msg.ohlc as Record<string, unknown>;
-      const tfSec = PROVIDERS_CONFIG.deriv.granularityMap[this.activeTimeframe ?? '1m'] ?? 60;
       const openTime = safeNum(ohlc.open_time);
       const candle: Candle = {
         time: openTime,
@@ -264,9 +281,16 @@ export class DerivSource implements DataSource {
         close: safeNum(ohlc.close),
         volume: 0,
       };
-      const now = Math.floor(serverClock.now() / 1000);
-      const isClosed = now >= openTime + tfSec;
-      this.emit(this.candleListeners, candle, isClosed);
+
+      // Detect candle close by open_time advancing: when Deriv sends the first
+      // update for a new candle, the previous candle is closed.
+      if (this.lastEmittedCandleTime !== null && openTime > this.lastEmittedCandleTime && this.lastEmittedCandle) {
+        this.emit(this.candleListeners, this.lastEmittedCandle, true);
+      }
+
+      this.lastEmittedCandleTime = openTime;
+      this.lastEmittedCandle = candle;
+      this.emit(this.candleListeners, candle, false);
     }
   }
 

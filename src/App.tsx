@@ -1,6 +1,5 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, lazy, Suspense } from 'react';
 import { Header } from '@/ui/Header';
-import { ChartPanel } from '@/ui/ChartPanel';
 import { IndicatorPanel } from '@/ui/IndicatorPanel';
 import { SignalFeed } from '@/ui/SignalFeed';
 import { CalibrationPanel } from '@/ui/CalibrationPanel';
@@ -23,6 +22,8 @@ import { useAiAnalysis } from '@/hooks/useAiAnalysis';
 import { findSymbol } from '@/data/symbols';
 import { unlockAudio } from '@/lib/audio';
 import { initSentry } from '@/lib/sentry';
+
+const ChartPanel = lazy(() => import('@/ui/ChartPanel').then(m => ({ default: m.ChartPanel })));
 
 type Phase = 'health' | 'onboarding' | 'terminal';
 
@@ -80,7 +81,9 @@ export default function App() {
       <div className="flex flex-1 flex-col overflow-hidden lg:flex-row">
         <main className="flex min-h-0 flex-1 flex-col">
           <div className="relative min-h-0 flex-1">
-            <ChartPanel candles={candles} snapshot={indicatorSnapshot} series={indicatorSeries} />
+            <Suspense fallback={<div className="flex h-full items-center justify-center text-base-400">Loading chart…</div>}>
+              <ChartPanel candles={candles} snapshot={indicatorSnapshot} series={indicatorSeries} />
+            </Suspense>
             <AiAnalysisOverlay
               loading={ai.state.loading}
               result={ai.state.result}

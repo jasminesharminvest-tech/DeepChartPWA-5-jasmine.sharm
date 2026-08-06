@@ -37,6 +37,25 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (id.includes('lightweight-charts')) return 'vendor-charts';
+            if (id.includes('@supabase')) return 'vendor-supabase';
+            if (id.includes('@sentry')) return 'vendor-sentry';
+            if (id.includes('zustand')) return 'vendor-zustand';
+            if (id.includes('react') || id.includes('scheduler')) return 'vendor-react';
+            return;
+          }
+          if (id.includes('/src/decision/')) return 'app-decision';
+          if (id.includes('/src/compute/')) return 'app-compute';
+          if (id.includes('/src/data/sources/')) return 'app-sources';
+        },
+      },
+    },
+  },
   optimizeDeps: {
     exclude: ['lucide-react'],
   },
